@@ -61,9 +61,10 @@ firebase.config.ts
 *.jks
 *.mobileprovision
 
-# Docs: ignore all markdown except README
+# Docs: ignore all markdown except README and the system context document
 *.md
 !README.md
+!SYSTEM_CONTEXT.md
 
 # Exclude research and scripts from repo
 research/
