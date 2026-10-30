@@ -8,6 +8,8 @@ Root `README.md` is a single line: `# SafeNaari`.
 
 The product name used in the mobile UI is **SafeNaari**. Package descriptions, the Express process log, the FastAPI title, and the admin sidebar still say **Women Safety Analytics**.
 
+Sections 1–12 are the file-by-file reference. Sections 13–16 are the same system written the way each role would have to hold it: architecture, then machine learning, data science, and fullstack. Those later sections cite the functions and the formulas that are actually in the tree. They do not add a model, a metric, or a service that the code does not contain.
+
 ---
 
 ## 1. What the running system is
@@ -1062,3 +1064,779 @@ These commands are the scripts in the manifests, not a verified run from this do
 6. Mobile: from `frontend/mobile`, `npm install`, `npm start`. The dev API host is hardcoded in `src/services/api.ts`. Native maps need the Google key already placed in `app.json` and a build that includes `react-native-maps`. `eas.json` is set up for EAS APK builds.
 
 `npm test` in `backend/api` is the placeholder that exits 1. The Python step scripts and the two Node axios scripts are manual.
+
+---
+
+## 13. Architecture, as the code is wired
+
+This is the shape of the system an engineer has to keep in their head. It is the same four processes from section 1, drawn by ownership rather than by folder.
+
+```
++-------------------+                     +------------------------+
+| Expo app          | -- HTTP + Socket -> | Express  :3001         |
+| frontend/mobile   |                     | backend/api            |
+| no JWT, user123   |                     | auth, Google, fan-out  |
++-------------------+                     +-----------+------------+
+                                                      |
++-------------------+                                 | axios / fetch
+| Vite admin :5174  | -- /api proxy, Bearer JWT ----> |
+| frontend/admin    |                                 v
++-------------------+                     +------------------------+
+                                          | FastAPI  :8000         |
+                                          | backend/ml             |
+                                          | score, cluster, SQL    |
+                                          +-----------+------------+
+                                                      | psycopg2
+                                                      v
+                                          +------------------------+
+                                          | PostgreSQL :5433       |
+                                          | women_safety_db        |
+                                          | incidents (+ PostGIS)  |
+                                          +------------------------+
+
+Google is called only from Express, never from the phone's route screen
+and never from FastAPI:
+  routes.googleapis.com/directions/v2:computeRoutes
+  maps.googleapis.com/maps/api/place/autocomplete/json
+  maps.googleapis.com/maps/api/geocode/json
+
+The phone opens maps.google.com URLs itself for "view on map" and
+"open in Google Maps". Those are links, not the Routes API.
+The native map tiles use the key in app.json, separate from
+GOOGLE_MAPS_API_KEY on the server.
+```
+
+### 13.1 Who owns which fact
+
+| Fact | Owner | Everyone else |
+| --- | --- | --- |
+| Incident rows | PostgreSQL, written only by `backend/ml/app/db/storage.py` | Express never opens a database connection. The admin UI never talks to FastAPI directly. |
+| Risk number 0–5 | `calculate_risk_score` / `_calculate_risk_score_from_incidents` in `backend/ml/app/ml/risk_scoring.py` | Mobile and admin only display it. Express forwards it. |
+| Heatmap cells | `generate_heatmap` in `backend/ml/app/ml/heatmap.py` | Android/iOS draw circles. Admin prints a table. |
+| Unsafe-zone clusters | In-process DBSCAN cache in `backend/ml/app/ml/clustering.py` | The `unsafe_zones` table is created by SQL and never inserted. |
+| Driving geometry | Google Routes API, decoded in `backend/api/src/services/googleMapsService.ts` | FastAPI only receives waypoints and returns scores. |
+| Admin identity | JWT signed in `backend/api/src/middleware/auth.ts` | FastAPI has no auth. Mobile sends no token. |
+| Emergency contacts | AsyncStorage key `@emergency_contacts` on the phone | `PUT /api/auth/emergency-contacts` echoes the body and stores nothing. |
+| Report prose and media | Phone memory until submit, then discarded | The database has no description column and no media column. |
+
+### 13.2 Synchronous path versus the socket
+
+Almost every user action is a request that finishes before the UI updates:
+
+1. Phone or browser calls Express.
+2. Express calls FastAPI and waits (axios timeout 120 seconds for the ML client; Google Routes timeout 15 seconds; Places timeout 10 seconds; geocode timeout 5 seconds).
+3. FastAPI runs SQL and Python in the request.
+4. Express maps the JSON and returns.
+
+The socket is a side channel, not the source of heatmap geometry. `POST /api/reports/submit` calls `emitNewIncident` after the ML insert. Clients that joined `incidents:all`, and clients whose location room covers the point, receive `incident:new`. The Android map then waits 2 seconds and calls `fetchHeatmap` again over HTTP. `emitHeatmapUpdate` exists in `backend/api/src/websocket/socketHandler.ts` and has no caller, so the event `heatmap:update` is never produced. `emitRiskAlert` is the same: defined, never called, and no socket joins `user:<id>`.
+
+Panic does not emit `incident:new`. A panic row is still inserted.
+
+### 13.3 Failure policy is different per route
+
+| Call | If the ML service errors |
+| --- | --- |
+| Heatmap (`GET /api/location/heatmap`) | HTTP 200, empty `cells`, warning string. The map stays up with nothing drawn. |
+| Risk on location update | The update still returns 200. `riskAssessment` is null only if `getRiskScore` throws. The ML client usually returns a fallback score of `0` / `very_safe` instead of throwing. |
+| Safe routes | HTTP 503 when `analyzeRoutes` returns `success: false`. |
+| Report submit | HTTP 200 even when the ML client returns `success: false` inside the normal return, because the route checks the call did not throw. The fallback object does not throw. |
+| Admin analytics | HTTP 502 when `getIncidentsAll` returns `success: false`. |
+| Admin heatmap | HTTP 200 with whatever cells came back, plus a warning. |
+
+FastAPI itself turns exceptions into HTTP 500 with `detail`. Express then applies the table above.
+
+### 13.4 Process boundaries that matter when changing a feature
+
+A change to the score formula is entirely inside `risk_scoring.py`, but every surface that shows a number will move together: mobile circles, admin top-20 table, route safety percent, dashboard nothing (the dashboard does not show risk), and the panic location response.
+
+A change to what is stored on an incident has to touch, in order: `IncidentRequest` in `backend/ml/app/api/schemas.py`, the `INSERT` in `app/db/storage.py`, a migration, the `SELECT` column lists in `get_incidents` and `get_incidents_in_radius`, the Express body in `reports.ts` or `panic.ts`, and the mobile `fetch` body. Description never made it past step "Express body". The phone sends it. The handler requires it. The Pydantic model has no field for it, so it is dropped before the insert.
+
+---
+
+## 14. Machine learning, from the model owner's seat
+
+This section is the system as the person responsible for `backend/ml/app/ml` has to understand it. The product copy says "ML-powered". The code is a deterministic scoring function plus one unsupervised clustering algorithm. There is no fitted regressor, no classifier, no saved weights, and no training loop that updates parameters from data.
+
+`backend/ml/app/ml/models.py` is the file a reader would open looking for that loop. `train_models` reads `get_incident_count()` and returns `started: True` and the string `"5 minutes"`. `get_model_status` returns `loaded: True` and `last_training` set to `datetime.utcnow()` at the moment of the health check. Both functions contain TODO comments. `POST /ml/models/train` exposes that stub. `joblib` is pinned in `requirements.txt` and is not imported. `settings.model_path` (`./models`) is never read. `settings.auto_retrain_threshold` and `settings.min_retrain_interval` are never read.
+
+The only scikit-learn call in the repository is `DBSCAN` in `backend/ml/app/ml/clustering.py`. It is fit on demand, in memory, and discarded except for the cluster summary cache.
+
+### 14.1 What is being predicted
+
+Nothing is predicted from a held-out label. For a query point `(lat, lng)` and a local hour, the service returns a scalar in `[0, 5]` and a string level. The scalar is a weighted blend of four quantities computed from incidents already stored within 1000 meters:
+
+| Factor | Range before the final `* 5` | Weight in `Settings` | Meaning in the code |
+| --- | --- | --- | --- |
+| `incident_density` | `[0, 1]` | `0.5` | Log of a recency-and-hour weighted count, divided by the log of `max_expected_effective_incidents + 1` (default max 10). |
+| `avg_recency` | `[0, 1]` | `0.25` | Distance-and-hour-weighted average of per-incident exponential decay. |
+| `avg_severity` | `[0, 1]` | `0.15` | Weighted mean of `severity / 5`. |
+| `time_pattern` | roughly `[0, 1]` | `0.1` | Mix of the clock prior and whether this hour matches the dominant historical bucket at this place. |
+
+```python
+risk_score = (
+    settings.weight_incident_density * incident_density
+    + settings.weight_recency * avg_recency
+    + settings.weight_severity * avg_severity
+    + settings.weight_time_pattern * time_pattern
+) * 5.0
+risk_score = max(0.0, min(5.0, risk_score))
+```
+
+That block is `_calculate_risk_score_from_incidents` in `backend/ml/app/ml/risk_scoring.py`. The weights in `backend/ml/app/config.py` sum to 1, so the theoretical maximum is 5 and the theoretical minimum, when incidents exist and every factor is 0, is 0. Rounding is to 2 decimal places on the way out.
+
+Levels, applied only on this path (the empty-neighborhood path is different, below):
+
+| Rounded score | `risk_level` |
+| --- | --- |
+| `<= 1.0` | `very_safe` |
+| `<= 2.0` | `safe` |
+| `<= 3.0` | `medium` |
+| `<= 4.0` | `high` |
+| otherwise | `very_high` |
+
+Columns that exist on the row and are **not** inputs to this function: `type`, `category`, `verified`, `moderation_reason`, `user_id`, `id`. A rejected incident with `verified = false` still enters the sums. A panic and a community report with the same severity, place, and time contribute the same weight. Category strings never reach the formula.
+
+### 14.2 Online inference, one point
+
+`calculate_risk_score(lat, lng, query_timestamp=None, local_hour=None)` does two things:
+
+1. `get_incidents_in_radius(lat, lng, 1000)` — PostGIS `ST_DWithin` on the `geography` column, radius in meters, no time filter, no verified filter.
+2. Hand that list to `_calculate_risk_score_from_incidents` with `radius_meters=1000`.
+
+The inner function filters again with haversine `<= 1000`. For the single-point API that filter is redundant with PostGIS. Heatmap calls the inner function with a pre-collected neighborhood, so the second filter is what keeps a cell's neighborhood round in meters rather than square in bins.
+
+Query time defaults to `datetime.now(timezone.utc)`. Query hour defaults to `now.hour` when `local_hour` is omitted. `datetime.now()` without a timezone is the **server process** local hour, not the phone hour. Call sites that omit `local_hour`:
+
+- `GET /ml/risk-score` when the query string has no `local_hour`. Express `getRiskScore` in `backend/api/src/services/mlService.ts` sends only `lat` and `lng`. Location updates therefore use the API host's clock.
+- `get_clusters`, which calls `calculate_risk_score(center_lat, center_lng)` with no hour.
+- `analyze_routes`, which calls `calculate_risk_score(mid_lat, mid_lng)` per segment with no hour.
+
+Heatmap generation is the path that does pass the phone's `local_hour`, because `GET /api/location/heatmap` forwards it and `generate_heatmap` passes it into the inner scorer.
+
+### 14.3 Kernels, with the numbers the code produces
+
+Three kernels multiply. They are all in `risk_scoring.py`.
+
+**Distance.** For each incident inside the 1000 m cutoff:
+
+```python
+distance_weight = math.exp(-distance_meters / 111.0)
+```
+
+The length scale is 111 meters. Values:
+
+| Distance | Weight |
+| --- | --- |
+| 0 m | 1 |
+| 111 m | `exp(-1)` ≈ 0.368 |
+| 222 m | `exp(-2)` ≈ 0.135 |
+| 500 m | `exp(-500/111)` ≈ 0.011 |
+| 1000 m | `exp(-1000/111)` ≈ 0.00012 |
+
+An incident at the edge of the search radius barely moves the weighted sums. It still counts in `raw_incident_count`. It does **not** use distance inside `effective_incident_count` (next paragraph).
+
+**Recency.** `calculate_recency_weight`:
+
+```python
+decay_days = max(1.0, float(settings.recency_decay_days))  # default 30
+return math.exp(-days_ago / decay_days)
+```
+
+This is an e-folding time, not a half-life. Half-life would be `decay_days * ln(2)` ≈ 20.8 days at the default.
+
+| Age | Weight at 30-day scale |
+| --- | --- |
+| 0 | 1 |
+| 7 days | ≈ 0.792 |
+| 30 days | ≈ 0.368 |
+| 90 days | ≈ 0.050 |
+| 365 days | ≈ 5.2e-6 |
+
+`days_ago` is `(query_timestamp - incident_timestamp).total_seconds() / 86400`. Future timestamps produce a negative age and a weight above 1. The code does not clamp that.
+
+**Hour-of-day similarity.** Circular distance on 0–23, then a Gaussian:
+
+```python
+d = abs(a - b) % 24
+dh = min(d, 24 - d)
+w = exp(-(dh ** 2) / (2 * sigma ** 2))   # sigma default 3 hours, minimum 0.25
+w = clip(w, floor, 1)                     # floor default 0.05
+```
+
+| Hour gap | Weight before the floor | After the 0.05 floor |
+| --- | --- | --- |
+| 0 | 1 | 1 |
+| 1 | ≈ 0.946 | ≈ 0.946 |
+| 3 | ≈ 0.607 | ≈ 0.607 |
+| 6 | ≈ 0.135 | ≈ 0.135 |
+| 9 | ≈ 0.011 | 0.05 |
+| 12 | ≈ 0.0003 | 0.05 |
+
+The floor means an incident from the opposite side of the clock never goes to zero. It keeps 5% of its recency weight in `effective_incident_count`.
+
+The incident hour used for `dh` is `_incident_hour_local`: the stored `incident_local_hour` if it is an int in 0–23, else `timestamp + timezone_offset_minutes`, else `timestamp.hour`. If that still fails, the scorer substitutes the query hour, which makes `time_weight = 1` for that row.
+
+**Combined weight** for severity and for the recency average:
+
+```python
+weight = distance_weight * recency_weight * time_weight
+effective_incident_count += recency_weight * time_weight
+```
+
+`effective_incident_count` ignores distance. Ten brand-new, same-hour incidents 900 m away still add almost `10 * 1 * 1` to the effective count, while they add almost nothing to `weighted_severity` because distance weight is ~0.0003. Density can therefore read "busy" for a neighborhood whose nearby-in-meters incidents are actually far inside the 1 km disk. That split is what the code does. The comment in `config.py` says density is calibrated on effective count because old incidents decay. It does not say that distance is left out of the count on purpose; the addition line simply does not multiply by `distance_weight`.
+
+### 14.4 Density, severity, recency aggregates
+
+```python
+max_expected = max(1.0, settings.max_expected_effective_incidents)  # 10
+incident_density = log(effective_incident_count + 1) / log(max_expected + 1)
+incident_density = clip(incident_density, 0, 1)
+```
+
+| Effective count | Density |
+| --- | --- |
+| 0 | 0 |
+| 1 | `log(2)/log(11)` ≈ 0.289 |
+| 3 | ≈ 0.578 |
+| 10 | 1 |
+| 30 | `log(31)/log(11)` ≈ 1.43, then clipped to 1 |
+
+So the density term saturates once about ten "fresh, same-hour" incidents sit inside the 1 km disk. More incidents cannot raise the density contribution above `0.5 * 5 = 2.5` points of the final score.
+
+Severity:
+
+```python
+avg_severity = (sum(severity_i * weight_i) / sum(weight_i)) / 5.0
+```
+
+A neighborhood of only severity-5 incidents has `avg_severity = 1`. Only severity-1 incidents have `0.2`. If `total_weight` is 0 the code uses 0. That happens when every incident was skipped by timestamp parsing.
+
+Recency aggregate is not the mean of recency weights alone. It is
+
+```python
+avg_recency = sum(recency * distance * time) / sum(distance * time)
+```
+
+which is the distance-and-hour-weighted mean of recency. A fresh incident far away contributes little. A fresh incident on top of the query point contributes a lot.
+
+### 14.5 The clock prior and the historical bucket
+
+`calculate_time_of_day_factor(local_hour)` does not look at data:
+
+| Local hour | Factor | Comment in the function |
+| --- | --- | --- |
+| 21, 22, 23, 0, 1, 2, 3 | 0.9 | night |
+| 18, 19, 20 | 0.7 | evening |
+| 4, 5, 6, 7 | 0.6 | early morning |
+| 8 through 17 | 0.3 | daytime |
+
+Separately, incidents that survived the 1 km filter are counted into buckets. These lists are **not** the same partitions:
+
+| Bucket | Hours in the list |
+| --- | --- |
+| night | 21, 22, 23, 0, 1, 2, 3, **4** |
+| evening | 18, 19, 20 |
+| afternoon | 12, 13, 14, 15, 16, 17 |
+| morning | 6, 7, 8, 9, 10, 11 |
+
+Hour **5** is in none of the lists. An incident whose local hour is 5 increments no counter. Hour **4** is "early morning" in the clock prior (factor 0.6) and "night" in the historical bucket. The dominant bucket is `max(pattern_counts, key=pattern_counts.get)`. On a tie, Python's `max` keeps the first key with that value. Dict order is night, evening, afternoon, morning.
+
+If the query hour sits in the dominant bucket:
+
+| Dominant share | `location_time_pattern` |
+| --- | --- |
+| `> 0.5` | `0.9 + share * 0.1` (between 0.95 and 1.0) |
+| `> 0.3` | `0.7 + share * 0.2` |
+| any smaller match | `0.5 + share * 0.2` |
+| query hour not in the dominant bucket | `current_time_factor * 0.6` |
+
+Then:
+
+```python
+time_pattern = 0.7 * location_time_pattern + 0.3 * current_time_factor
+```
+
+If no incident had a parseable hour, `time_pattern` is just `current_time_factor`.
+
+Worked night case. Query hour 22, clock factor 0.9. Dominant bucket is night with share 0.8. Match, so `location_time_pattern = 0.9 + 0.08 = 0.98`. `time_pattern = 0.7 * 0.98 + 0.3 * 0.9 = 0.956`. Contribution to the 0–5 score: `0.1 * 0.956 * 5 ≈ 0.48`.
+
+Worked mismatch. Same place queried at hour 10 (factor 0.3) while nights dominate. `location_time_pattern = 0.3 * 0.6 = 0.18`. `time_pattern = 0.7 * 0.18 + 0.3 * 0.3 = 0.216`. Contribution ≈ 0.11. The Gaussian hour kernel will also down-weight the night incidents in the density and severity terms, which is the larger effect. The bucket logic is an extra 10% of the blend, not the whole time model.
+
+### 14.6 Empty neighborhood
+
+If the incident list is empty, or haversine filtering removes all of them, the function does **not** return score 0. It returns:
+
+```python
+base_risk = current_time_factor * 1.5
+risk_level = "safe" if base_risk < 2.0 else "medium"
+```
+
+| Hour band | Factor | Score | Level from this branch | Level the five-way scale would have assigned |
+| --- | --- | --- | --- | --- |
+| Night | 0.9 | 1.35 | `safe` | `safe` |
+| Evening | 0.7 | 1.05 | `safe` | `safe` |
+| Early morning | 0.6 | 0.90 | `safe` | `very_safe` |
+| Day | 0.3 | 0.45 | `safe` | `very_safe` |
+
+No configured factor times 1.5 reaches 2, so this branch never returns `medium` with the current table. It also never returns `very_safe`. Factors in the payload are zeros plus `current_time_factor`. There is no `calculated_at` key on this branch; the incident branch includes `calculated_at`.
+
+The mobile map drops cells with `risk_score <= 1.0`. An empty day cell at 0.45 would be hidden. An empty night cell at 1.35 would be drawn, in the yellow band, even though no incident was nearby. Heatmap generation does not emit a cell at all when a bin has no incidents (section 14.7), so this empty-neighborhood score is what `GET /ml/risk-score` and route midpoints see in quiet areas, not what the heatmap draws in empty ocean or empty wards.
+
+### 14.7 Heatmap is repeated inference, not a second model
+
+`generate_heatmap` in `backend/ml/app/ml/heatmap.py` does not score a full lattice. The comment in the function calls the approach option B: cells exist only where incidents exist.
+
+Algorithm, in the order the function runs:
+
+1. `radius_degrees = radius_meters / 111000`, same for longitude. The box is not corrected by `cos(latitude)`. At about 13° N, one degree of longitude is about `cos(13°) ≈ 0.974` of a degree of latitude in ground meters, so the degree box is slightly short east-west relative to the requested meter radius. Incident **fetch** uses PostGIS meters. Bin **indexes** use the degree box only as an origin. Points are not clipped to the box; a negative bin index is allowed.
+2. If a naive full grid would exceed 3000 cells, `grid_size_degrees` is increased. The `grid_size` integer returned to the client stays the requested meter size. The mobile circle radius uses the requested `query.gridSize`, not the adjusted degree size.
+3. `incidents_in_view = get_incidents_in_radius(center, radius_meters)`.
+4. `incidents_context = get_incidents_in_radius(center, radius_meters + 1000)` so a cell near the edge of the view still sees its own 1 km disk.
+5. Both sets are dropped into dicts keyed by `(i, j)` where `i = int((lat - lat_min) / grid_size_degrees)`.
+6. For each view bin, the cell coordinate is the **mean lat/lng of incidents in that bin**, not the geometric center of the square.
+7. `is_point_allowed(cell_lat, cell_lng)` can drop the cell. With `land_mask_enabled = False` this returns true immediately.
+8. Neighborhood bins are gathered with `neighbor_range = ceil(1000 / grid_size_meters)`, then haversine-filtered to 1000 m, then scored with the same function as a single point, including `local_hour`.
+9. The cell's `incident_count` is the number of incidents **in the bin**, not the number used in the score.
+10. The loop stops at 3000 cells.
+
+If the view radius contains no incidents, `cells` is `[]`. The comment in the function says a previous fallback put a marker on the viewport center and that marker followed pan and zoom, so it was removed. On an exception, the `except` builds one zero-risk cell at the center so the response is not empty.
+
+`include_clusters` defaults to false. The mobile route passes false. The admin route passes true. When true, `get_clusters()` output is attached with **no geographic filter**. An admin query centered on Chennai still receives every cluster computed from the whole table.
+
+`include_time_factor` is a query parameter on `GET /ml/heatmap` and is not read inside `generate_heatmap`. Time is applied whenever `local_hour` is passed, which the route always resolves to some integer.
+
+### 14.8 DBSCAN, the only learned partition
+
+`get_clusters` in `backend/ml/app/ml/clustering.py`:
+
+```python
+clustering = DBSCAN(
+    eps=settings.dbscan_eps,          # 0.001
+    min_samples=settings.dbscan_min_samples,  # 3
+    metric="euclidean",
+)
+cluster_labels = clustering.fit_predict(coordinates)  # shape (n, 2) of [lat, lng]
+```
+
+Inputs are raw degrees, not projected meters, not a haversine metric. `eps = 0.001` degrees. The config comment says "~100 meters". At the equator, 0.001° of latitude is about 111 m. At 13° N, 0.001° of longitude is about 108 m. The epsilon neighborhood is therefore an ellipse in ground distance, about 111 m north-south and 108 m east-west. Points farther apart than that, even if they sit in the same named area in the mock generator, become separate clusters or noise.
+
+`min_samples = 3`. Fewer than 3 incidents in the whole table yields `[]` without calling DBSCAN. Label `-1` is noise and is discarded. For each remaining label:
+
+- Center is the arithmetic mean of member latitudes and longitudes.
+- Radius is the max Euclidean distance in **degrees** from that mean, times `111000`. East-west extent is converted with the latitude scale, so the reported meter radius is a bit larger than haversine for an east-west chain.
+- `incident_count` is the number of member rows.
+- `risk_score` is a fresh `calculate_risk_score` at the center, with the server's current hour, not an aggregate of member severities.
+- Id is `cluster_<sklearn label>`.
+
+`update_clusters_if_needed`, called on every successful `POST /ml/incidents/process`, sets the module-level cache to `None` and returns `[]`. It does not refit. The next `get_clusters()` refits. The cache is per process. `affected_zones` in the process-incident response is that empty list. `model_updated` is hardcoded `False` in the route.
+
+DBSCAN here is not a safety model. It is a grouping of points for the admin heatmap page and for the optional `clusters` array. The mobile map does not draw those circles. `HeatmapMap.android.tsx` has a comment that cluster markers were removed.
+
+### 14.9 Routes are a reduction over the same point score
+
+`analyze_routes` in `backend/ml/app/ml/route_analyzer.py` does not call Google. Express has already turned a Google encoded polyline into waypoints (`decodePolyline` in `googleMapsService.ts`, scale `1e-5`).
+
+For each consecutive pair:
+
+- Segment length is haversine with Earth radius `6371000` (the same formula as `app/utils/geospatial.py`, copied into this file).
+- Risk is `calculate_risk_score` at the arithmetic midpoint `(lat1+lat2)/2`, `(lng1+lng2)/2`. That is not the geodesic midpoint. Each call issues its own `ST_DWithin` for 1000 m. A polyline with *N* vertices costs *N − 1* risk queries. `local_hour` is not passed.
+- If segment risk `>= 3.5`, the segment is stored in `high_risk_segments`.
+
+Route scores:
+
+```python
+avg_risk = weighted_risk_sum / total_distance          # weighted by segment length
+safety_score = max(0.0, 1.0 - (avg_risk / 5.0))
+safe_distance = total_distance                         # comment: "Simplified for now"
+```
+
+`safe_distance` is not the length of segments under a threshold. The API still returns it, and the mobile `SafeRoute` type still has `safeDistance`.
+
+The recommended id is chosen in the FastAPI handler, not in the analyzer:
+
+```python
+recommended = max(routes_analysis, key=lambda r: r.safety_score).id
+```
+
+Ties keep the first maximum `max` finds, which is list order. Express builds route ids `route_primary`, then `route_alternative_1`, and so on, in Google response order. The primary route wins a tie.
+
+If Google returns nothing or throws, `getRouteOptions` returns one synthetic route, `route_direct`, whose only waypoints are the start and the end. The analyzer then scores a single midpoint of the straight line. The user still gets a safety number. It is the score of that midpoint, not of a road.
+
+### 14.10 Land mask is a filter in front of scoring, and it is off
+
+`backend/ml/app/utils/land_mask.py` implements ray-casting point-in-polygon over every polygon in a GeoJSON feature collection, with a bounding-box reject before the ray cast, and with holes excluded. The file on disk, `backend/ml/app/resources/landmask/chennai_wards.geojson`, is a `FeatureCollection` with 201 features. If the file were missing, the loader would download the Datameet Chennai wards URL stored in settings.
+
+`settings.land_mask_enabled` is `False`. `is_point_allowed` returns `True` before it opens the file. The module docstring says Shapely union was avoided because of a Shapely/NumPy failure in the environment they were using. `shapely` remains in `requirements.txt` and is not imported. If the flag is turned on and the file fails to parse, the function fails open (returns true) so heatmap generation continues.
+
+Masking drops cells. It does not drop incidents from the database, and it is not applied inside `calculate_risk_score`. A point in the sea can still receive a risk score from the single-point API.
+
+### 14.11 What happens at ingest, which is the only "learning"
+
+`POST /ml/incidents/process` → `add_incident`:
+
+- Inserts the row.
+- Computes `incident_local_hour` as `(timestamp + timedelta(minutes=offset)).hour` when the client sent `timezone_offset_minutes`, otherwise `timestamp.hour`.
+- Builds `location` with `ST_MakePoint(longitude, latitude)` cast to `geography`.
+- Does not update weights.
+- Invalidates the DBSCAN cache.
+
+The next heatmap or risk call reads the new row if it falls inside the radius. That is the entire online update. There is no minibatch, no decay table, no feature store separate from `incidents`.
+
+### 14.12 Complexity the service actually pays
+
+For one heatmap request:
+
+- Two `ST_DWithin` queries (view radius, and view radius + 1000 m).
+- One Python score per occupied bin, each walking the incidents in neighboring bins. No extra SQL per cell, because the neighborhood is sliced from the context list. This is why heatmap cells call `_calculate_risk_score_from_incidents` directly instead of `calculate_risk_score`.
+- If `include_clusters` is true, one additional full-table `SELECT` inside `get_incidents()` and one DBSCAN fit, plus one radius query per cluster center for that center's risk score.
+
+For one route with *S* segments: *S* radius queries, run sequentially inside the async function. The function is `async` but the body does not `await` anything. The SQL calls are synchronous psycopg2.
+
+For `GET /ml/incidents/all`: one unbounded `SELECT` of every incident, then a Python filter and slice. Admin analytics asks for `limit=1000`. The cap is applied after the full read.
+
+### 14.13 Knobs, and the ones that are dead
+
+Live knobs, all overridable by environment variables because `Settings` is a `BaseSettings` with `case_sensitive = False`:
+
+| Env-style name | Default | Effect |
+| --- | --- | --- |
+| `WEIGHT_INCIDENT_DENSITY` | 0.5 | Blend |
+| `WEIGHT_RECENCY` | 0.25 | Blend |
+| `WEIGHT_SEVERITY` | 0.15 | Blend |
+| `WEIGHT_TIME_PATTERN` | 0.1 | Blend |
+| `MAX_EXPECTED_EFFECTIVE_INCIDENTS` | 10 | Density saturation |
+| `RECENCY_DECAY_DAYS` | 30 | Age kernel |
+| `TIME_OF_DAY_SIGMA_HOURS` | 3 | Hour kernel width |
+| `TIME_OF_DAY_MIN_WEIGHT` | 0.05 | Hour kernel floor |
+| `DBSCAN_EPS` | 0.001 | Cluster reach in degrees |
+| `DBSCAN_MIN_SAMPLES` | 3 | Cluster minimum |
+| `LAND_MASK_ENABLED` | false | Polygon filter |
+| `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, `DB_PASSWORD`, `DB_SSL` | localhost, 5433, `women_safety_db`, postgres, empty, false | Storage |
+
+Declared and unused: `MODEL_PATH`, `CACHE_TTL`, `DEFAULT_GRID_SIZE`, `DEFAULT_RADIUS`, `AUTO_RETRAIN_THRESHOLD`, `MIN_RETRAIN_INTERVAL`. Grid size and radius are request parameters, not these defaults. The heatmap route defaults are `radius=1000` and `grid_size=100` on the FastAPI signature itself.
+
+### 14.14 Invariants an ML change has to preserve
+
+These are consequences of the current callers, not extra requirements:
+
+- Scores must stay inside `[0, 5]`. Pydantic `HeatmapCell` and `RiskScoreResponse` declare `risk_score` with `ge=0, le=5`. A formula that returns 5.01 fails the response model.
+- `risk_level` strings the UI branches on are `very_safe`, `safe`, `medium`, `high`, `very_high`. The Android painter does not switch on the string. It switches on numeric bands at 1, 2, and 4, and it hides `<= 1`. Changing level names without changing numbers does not change the map. Changing numbers does.
+- Cell objects need `lat`, `lng`, `risk_score`, `risk_level`. `incident_count` and `last_incident` are present. The phone's `HeatmapCell` TypeScript type only requires `lat`, `lng`, `risk_score`, `risk_level`.
+- `safety_score` is documented in the schema as 0–1, higher safer. The phone multiplies by 100 for display and colors routes at 0.7 and 0.4.
+
+---
+
+## 15. Data science, from the person who has to trust the numbers
+
+This section is the same pipeline read as a dataset and a measurement problem. The question the running code answers is: given the incidents stored so far, how elevated is this coordinate at this local hour, on a fixed 0–5 scale? It does not answer "what is the probability of a future incident", and it does not answer "was this report true".
+
+### 15.1 The observation
+
+One row in `incidents` is one observation. There is no separate label table. The score is a function of the rows, so the rows are simultaneously the history and the only supervision. Holding out incidents and asking whether the score "predicts" them is not implemented. Nothing in the repo computes precision, recall, ROC, log loss, or a calibration curve.
+
+Fields a data scientist can use, because they are stored and returned by `get_incidents`:
+
+| Field | How it is produced for a live phone report | How it is produced for `step2` mock rows |
+| --- | --- | --- |
+| `latitude`, `longitude` | User-picked marker or panic GPS | Random offset around a named Chennai center, then clamped to the generator bounds |
+| `timestamp` | Phone `new Date().toISOString()` | `datetime.now(timezone.utc) - random days`, then `.replace(hour=chosen_hour)` |
+| `timezone_offset_minutes` | `-getTimezoneOffset()` from the phone (minutes east of UTC; IST is +330) | Not set. The generator never passes the field. |
+| `incident_local_hour` | Hour of `timestamp + offset` at insert | `timestamp.hour`, which is the hour the generator chose, stored on a UTC timestamp |
+| `type` | `community_report`, or `panic_alert` for SOS | Function of severity: severity ≤ 2 always community; severity 3 is 20% panic; severity ≥ 4 is 40% panic |
+| `severity` | User button 1–5, or 5 for panic | Function of area base severity, a time multiplier, noise, then extra resampling |
+| `category` | One of five Title Case phone labels | Lowercase `harassment`, `assault`, `suspicious`, `other` |
+| `verified` | `false` for reports, `true` for panics | `random.random() < 0.6` |
+| `user_id` | The literal `user123` | `user_` plus an integer from 1 to 200 |
+| `moderation_reason` | Null until an admin verify/reject | Null |
+
+`description` is collected on the phone and required by Express. It is not a column. Free text never enters analysis. Media picked with `expo-image-picker` never leaves the device.
+
+`verified` and `moderation_reason` change what the admin tables show. They do not change `get_incidents_in_radius`. A data scientist who treats "verified" as a clean analysis set has to filter in their own query. The scoring code will not.
+
+### 15.2 Time, and the two clocks
+
+Live path, the one that matches the comments in the mobile client:
+
+1. The phone sends an ISO UTC timestamp and `timezone_offset_minutes = -Date.getTimezoneOffset()`.
+2. It also sends `local_hour = Date.getHours()` on heatmap fetches.
+3. Insert stores `incident_local_hour` from timestamp plus offset.
+4. Later heatmap queries pass the viewer's current `local_hour`.
+5. The Gaussian compares that hour to each row's `incident_local_hour`.
+
+Mock path, `generate_chennai_incidents` / `_generate_incident_in_area`:
+
+```python
+base_time = datetime.now(timezone.utc) - timedelta(days=days_ago)
+hour = _generate_risk_aware_hour(risk_level)
+timestamp = base_time.replace(hour=hour, minute=random.randint(0, 59))
+```
+
+The chosen hour is written into the UTC timestamp. No offset is attached. After insert, `incident_local_hour` equals that chosen hour. Scoring that prefers the column will treat the generator's hour as "local". A human reading `timestamp` in IST will see a clock 5 hours 30 minutes later than the hour the generator thought it was assigning. The column and the UTC timestamp disagree with India local time by the offset the generator forgot to set. Analyses that recompute local hour as `timestamp + 330 minutes` will not match `incident_local_hour` for these rows. Analyses that trust the column will.
+
+`HIGH_RISK_DAYS = [4, 5]` is defined in `chennai_mock_data.py` and is not read. Weekday is not a feature of the generator or of the scorer.
+
+### 15.3 How the synthetic incidents are actually placed
+
+The generator's own docstring says the named areas are assumptions for test data and that the scoring code does not receive the area names. That is true. The names exist only in the Python lists `HIGH_RISK_AREAS`, `MEDIUM_RISK_AREAS`, and `LOW_RISK_AREAS`. Once inserted, a row is indistinguishable from a phone row except by id prefix (`chennai_hr_`, `chennai_mr_`, `chennai_lr_`) and by the missing timezone offset.
+
+Batch mix inside `generate_chennai_incidents`: `int(count * 0.40)` high, `int(count * 0.35)` medium, the remainder low. For 5000 that is 2000, 1750, and 1250. `step2_load_data.py` truncates the table and loads 5000. The printout divides by 426 and calls the result incidents per km². The number 426 is a literal in that print and in `load_chennai_mock_data_into_storage`. It is not computed from the ward GeoJSON.
+
+Placement inside an area:
+
+```python
+radius_degrees = area["radius_km"] / 111.0
+angle = random.uniform(0, 2 * 3.14159)          # computed, never used
+distance_degrees = random.uniform(0, radius_degrees)
+lat = area["lat"] + distance_degrees * random.uniform(-1, 1)
+lng = area["lng"] + distance_degrees * random.uniform(-1, 1)
+```
+
+The unused `angle` means this is not a uniform disk. Each coordinate is perturbed by `U(-d, d)` with `d` uniform in `[0, radius]`. The point cloud is a fuzzy square around the center, denser near the center because small `d` is as likely as large `d` and then gets multiplied by another uniform. After that, latitude is clamped to `[12.85, 13.20]` and longitude to `[80.10, 80.35]`.
+
+Named centers the high tier samples from, with the generator's radius and base severity:
+
+| Name in the generator | Lat | Lng | Radius km | Base severity |
+| --- | --- | --- | --- | --- |
+| Central Railway Station | 13.0827 | 80.2707 | 0.5 | 4 |
+| Egmore Railway Station | 13.0790 | 80.2606 | 0.4 | 4 |
+| Marina Beach (Night Area) | 13.0475 | 80.2825 | 1.0 | 4 |
+| Koyambedu Bus Stand | 13.0710 | 80.1980 | 0.6 | 4 |
+| T. Nagar Market Area | 13.0418 | 80.2341 | 0.8 | 3 |
+
+Medium tier: Anna Nagar (13.0850, 80.2100, 1.2 km, base 3), OMR IT Corridor (12.9716, 80.2200, 2.0 km, base 2), Guindy (12.9716, 80.2206, 1.5 km, base 2). Low tier: Adyar Residential (13.0067, 80.2206, 2.0 km, base 1), Besant Nagar (12.9990, 80.2640, 1.5 km, base 1).
+
+Hour draw, `_generate_risk_aware_hour`:
+
+| Tier | High hours 22, 23, 0, 1, 2, 3 | Medium hours 18–21 | Low hours 6–17 |
+| --- | --- | --- | --- |
+| high | 0.60 | 0.30 of the remainder is not quite 0.30; the code draws high with probability 0.60, then with probability 0.75 of the **remaining** draw picks medium. That is `0.40 * 0.75 = 0.30` medium and `0.10` low. | 0.10 |
+| medium | 0.40 | 0.40 | 0.20 |
+| low | 0.20 | 0.30 | 0.50 |
+
+The medium-tier branch uses one `random.random()` and two thresholds, so its probabilities are exactly 0.40 / 0.40 / 0.20. The high-tier branch draws a second random after the first succeeded at `< 0.60`, so the comment "30% of remaining 40%" matches the arithmetic only in expectation if the second draw's 0.75 is applied to the complement. It is. The low tier is a single draw with cuts at 0.20 and 0.50.
+
+Severity, `_generate_severity`: start from `base_severity`, multiply by 1.2 if the chosen hour is in the high-hour list, 1.0 if in the medium list, 0.8 otherwise, add `U(-0.5, 0.5)`, round, clamp to 1–5. Then, if the tier is high and the result is below 3, with probability 0.80 replace it by a draw from `{3, 4, 5}` with weights 0.3, 0.4, 0.3. If the tier is low and the result is above 3, with probability 0.70 replace it by `{1, 2, 3}` with the same weights. The medium tier has no second resampling.
+
+Category given severity: severity ≥ 4 chooses harassment / assault / suspicious at 0.5 / 0.3 / 0.2. Severity 3 chooses harassment / suspicious / other at 0.4 / 0.4 / 0.2. Below that, suspicious / other / harassment at 0.4 / 0.4 / 0.2. The phone's categories are `Harassment`, `Suspicious Activity`, `Poor Lighting`, `Unsafe Area`, `Other`. The strings do not match. Admin "by category" will show both vocabularies if both sources have been loaded. The score ignores the string either way.
+
+`app/data/mock_data.py` is a second generator centered on `(40.7128, -74.0060)` with a 5 km radius and three hand-picked cluster offsets. Sixty percent of its points are near those offsets. `load_mock_data_into_storage` inserts through the same `add_incident`. The step scripts do not call it. `app/data/storage.py` is an in-memory list the live routes do not import.
+
+### 15.4 What gets measured, and what those scripts refuse to claim
+
+There is no experiment tracker. The measurements that exist are print statements.
+
+`step2_load_data.py` after the load: counts by `type`, counts by severity 1–5, verified versus not, min/max latitude and longitude, the 426 km² density print, and a bounding-box count around Central Station using `±0.009` degrees (the comment says ~1 km) through `get_incidents`, which is a lat/lng rectangle, not `ST_DWithin`.
+
+`step3_test_ml_algorithms.py`:
+
+- `get_clusters(force_recalculate=True)`.
+- Prints the ten largest clusters by `incident_count`, then sum of member counts, mean cluster size, mean risk, and `incident_count - total_clustered_incidents` as "scattered". That subtraction treats noise points as scattered. It is not a second DBSCAN statistic; noise points were never given a cluster id.
+- Scores five fixed coordinates with `calculate_risk_score` and prints the four factors.
+- "Verifying model learning" takes the first five clusters and the test locations whose score is `>= 3`, and counts a match when Euclidean distance in degrees is `< 0.005` (the comment says ~500 m). It prints a success line if `matches > 0`. This is not a statistical test. It does not use a holdout. The locations it calls high-risk are the same coordinates the generator was aimed at.
+
+`step4_test_heatmap.py` calls `generate_heatmap` with no `local_hour` for three centers: Marina Beach radius 1000 m grid 100 m, Central Station radius 800 m grid 100 m, Koyambedu radius 600 m grid 100 m. Because `include_clusters` defaults to false, the `clusters` list in that result is empty even though the script prints "Clusters found". The cell statistics it does compute, when cells exist, are mean, min, max of `risk_score`, and counts of the five `risk_level` strings, plus a list of cells with score `>= 3.5`.
+
+`step5_test_routes.py` builds four hand-specified polylines (through Central Station, around it, through Marina, through Adyar/Besant Nagar) and prints safety, risk, distance, and segments with risk `>= 3.5`. The safety bands it prints (`>= 0.8` very safe, `>= 0.6` safe, `>= 0.4` moderate, `>= 0.2` high, else very high) exist only in that script. The product uses `safety_score` as a number. The phone's colors are 0.7 and 0.4, which are different cuts.
+
+`test_risk_optimization.py` scores six coordinates, prints the factor breakdown, the min, max, mean, and a population standard deviation (divide by *n*, not *n − 1*), and then classifies the range `max - min`: above 2.0 "Good variation", above 1.0 "Moderate", otherwise "Low variation". Those words are not thresholds inside `risk_scoring.py`.
+
+`test_full_integration.py` checks the pool, the count, clustering, one risk call, one heatmap, and one route analysis. It does not call Express. Its docstring says it tests the backend API. The body does not.
+
+`test_mock_data.py` generates incidents in memory and does not need Postgres.
+
+None of these scripts write a result file. Re-running `step2` deletes every live incident in the table (`clear_incidents` is `TRUNCATE`).
+
+### 15.5 The admin aggregates are descriptive, and they are censored
+
+`GET /api/admin/analytics` in `backend/api/src/routes/admin.ts` is the only dashboard-style measurement in the product.
+
+- It asks FastAPI for 1000 incidents, newest first (`ORDER BY timestamp DESC` inside `get_incidents`).
+- It keeps rows with `timestamp >= cutoff`, where cutoff is local server midnight-ish: `setDate(today - days)` then `setHours(0,0,0,0)` on the Node process clock.
+- Day buckets are `toISOString().slice(0, 10)`, which is a **UTC** date. A report at 02:00 IST on Tuesday is still Monday UTC. The chart label parses that UTC date with `new Date(d.date)` in the browser, which interprets a date-only string as UTC midnight and can shift the label again in IST.
+- `byHour` uses `incident_local_hour` only. Null hours are dropped, not bucketed.
+- `byCategory` uses the raw string, or `uncategorized`.
+- Verification rate is `verified / incidentsInPeriod`, one decimal. It is not a rate over a population of users. There is no user dimension in the chart.
+- `totalIncidents` is the full SQL count. `incidentsInPeriod` cannot exceed 1000, and if more than 1000 incidents exist, older ones in the window are missing because the 1000 are the newest overall, not the newest inside the window. A 30-day window on a table of 5000 recent mock rows is computed from 1000 rows.
+
+`GET /api/admin/dashboard` computes "today", panic count, and verified count on a page of 100, while `totalIncidents` is the unpaged total. Those cards are not population totals. Section 5.10 records the same fact; it matters here because the cards look like data-science outputs and are not.
+
+`GET /api/admin/audit` is not an event log. It filters the newest 100 rows to those with a moderation reason or `verified === true`, keeps 50, and labels the action `verified` or `rejected` from the boolean. The timestamp shown is the incident time, not the time of the moderation update. `updated_at` is maintained by the database trigger and is not selected in `get_incidents`.
+
+### 15.6 Leakage, in the narrow sense that applies here
+
+There is no train/test split to leak across. The generator's area list is still a circular story if someone treats a high score at Central Station as evidence the model discovered Central Station. The score is high there when the inserted points are dense, recent, severe, and aligned in hour with the query. The generator put dense, severe, night-weighted points there. `step3` then checks whether clusters land near those same coordinates. A match supports "DBSCAN grouped the points we inserted close together". It does not support an independent geographic finding.
+
+The ward polygons are not used as features while the mask flag is off. Turning the mask on changes which cells are returned. It does not change the stored sample.
+
+### 15.7 A usable analysis frame, using only columns that exist
+
+Someone continuing this work from the current schema can group by `incident_local_hour`, `severity`, `type`, `category`, `verified`, and by spatial bins they compute themselves. They cannot recover the typed report text. They cannot recover whether two `user123` rows are the same person, because every live phone row uses that id. They can separate mock rows by the `chennai_` id prefix until a truncate. They should not interpret `incident_local_hour` on mock rows as IST. They should not interpret admin "today" as a full-table count. They should not interpret `safe_distance` as a measured safe length.
+
+The second mock generator's New York center will mix with Chennai rows if `load_mock_data_into_storage` is run against the same database. Nothing partitions by city.
+
+---
+
+## 16. Fullstack, from the person who ships the screens and the API
+
+This section is the system as the person who owns `frontend/mobile`, `frontend/admin`, and `backend/api` has to walk it. FastAPI is a dependency they call. They do not reimplement the score. They do own the contract, the auth gate, the realtime fan-out, the map, and every place a failure is turned into a 200.
+
+### 16.1 Runtime and repositories inside the repo
+
+Three Node packages, one Python package. No workspace file ties them. Lockfiles are gitignored (`package-lock.json` and `yarn.lock` in `.gitignore`).
+
+| App | Start | Dev URL the code expects |
+| --- | --- | --- |
+| `backend/ml` | `uvicorn app.main:app` or `python -m app.main` | `0.0.0.0:8000` |
+| `backend/api` | `npm run dev` → `nodemon src/app.ts` | `0.0.0.0:3001` |
+| `frontend/admin` | `npm run dev` | `localhost:5174`, proxy `/api` → `http://192.168.1.12:3001` |
+| `frontend/mobile` | `npm start` → Expo | API base `http://192.168.1.12:3001` when `__DEV__` |
+
+`backend/api/tsconfig.json` compiles `src` to `dist` as CommonJS, ES2020, `strict`, `exactOptionalPropertyTypes`, `noUncheckedIndexedAccess`. `npm start` runs `node dist/app.js`, so a production start needs `npm run build` first. `npm run dev` uses nodemon on TypeScript directly.
+
+Admin TypeScript is bundler mode, `noEmit`, JSX `react-jsx`. Mobile TypeScript extends `expo/tsconfig.base` and sets `strict`.
+
+Express 5 is the HTTP framework. The 404 handler is a non-error middleware with no path, registered after the routers. The error handler is four arguments and reads `err.status` and `err.message`.
+
+### 16.2 Screen map and the calls each screen makes
+
+Mobile tabs are declared only in `frontend/mobile/src/navigation/AppNavigator.tsx`. `App.tsx` renders that navigator and nothing else.
+
+| Tab | Component | Network |
+| --- | --- | --- |
+| Home | `HomeScreen` → `HeatmapMap.android` or `.ios`, else `HeatmapMapFallback` | `GET /api/location/heatmap`. Socket join for the current center and radius. Listens for `incident:new` and refetches after 2 seconds. Also refetches every 60 seconds. |
+| Panic | `PanicScreen` + `PanicButton` | `POST /api/panic/trigger` once. Then `POST /api/location/update` on a 30 second timer whose closure is described in section 6.10. Contacts are not a network call. |
+| Report | `ReportsScreen` + `LocationPicker` | `POST /api/reports/submit`. Image picker is local. |
+| Community | `CommunityReportsScreen` + `ReportDetailsScreen` | `GET /api/reports/all`. Socket `subscribe:incidents`, refetch after 1.5 seconds. "View on map" is a Google Maps URL via `Linking.openURL`, not a navigation to Home. |
+| Routes | `RoutePlanningScreen` | `GET /api/location/search-places`, `GET /api/location/place-coordinates`, `GET /api/location/safe-routes`. Directions handoff is another Google Maps URL. |
+
+`ContactsScreen` duplicates the contact editor and is not mounted. `SimpleMap` is not imported. The Home info button's `onPress` is empty. The address line under the map is the constant string `Connaught Place, New Delhi`. The map's first camera target, in `HeatmapMap.android.tsx`, is hardcoded Chennai `13.0827, 80.2707` with `latitudeDelta` 0.15 even after GPS succeeds. GPS is stored as a marker. It does not become the heatmap center unless the user pans or a `panToLocation` param arrives.
+
+Admin routes are in `frontend/admin/src/App.tsx`. Login is `/`. Everything under `/admin` checks that `localStorage.admin_token` is non-empty. It does not decode the JWT. Expiry is enforced only when an API call returns 401, which clears the token and sets `window.location.href = '/'`.
+
+| Page | Client method in `src/api/client.ts` | Express route |
+| --- | --- | --- |
+| Dashboard | `admin.dashboard()` | `GET /api/admin/dashboard` |
+| Moderation | `admin.incidents`, `admin.verify`, `admin.reject` | `GET /api/admin/incidents`, `POST .../verify`, `POST .../reject` |
+| Heatmap | `admin.heatmap(lat, lng, radius, 100)` | `GET /api/admin/heatmap` |
+| Analytics | `admin.analytics('7d' or '30d')` | `GET /api/admin/analytics` |
+| Audit | `admin.audit()` | `GET /api/admin/audit` |
+
+### 16.3 Auth, and the hole next to it
+
+Admin login, `POST /api/auth/admin-login`, compares plaintext to `ADMIN_EMAIL` / `ADMIN_PASSWORD` / `ADMIN_SECRET`, with defaults that accept user `admin` and password `admin`. `signAdminToken` uses `jsonwebtoken` and `JWT_SECRET`, falling back to `ADMIN_SECRET`, then to the string `change-me-in-production`. Payload is `{ sub, role }`, expiry `7d`. `requireAdmin` is mounted on the whole `/api/admin` router. It checks the `Bearer` prefix and `role === "admin"`.
+
+`POST /api/auth/login` returns the literal token `mock_jwt_token_here`. The mobile app does not call it. No mobile request sets `Authorization`. Panic, reports, heatmap, and routes are open on the LAN the process binds (`0.0.0.0`).
+
+`firebase-admin` is in `backend/api/package.json` and is not imported. `@react-native-firebase/auth`, `@react-native-firebase/app`, and `firebase` are in the mobile `package.json` and are not imported under `src`. `expo-secure-store` is an Expo plugin and is not imported. Contacts go through AsyncStorage, or through a process-memory object if that require throws (`frontend/mobile/src/utils/storage.ts`).
+
+The user id sent by panic and by reports is the string `user123` in source. The report screen marks that with a TODO.
+
+### 16.4 The JSON the phone sends, and the JSON that gets stored
+
+Report submit body built in `ReportsScreen.tsx`:
+
+```json
+{
+  "userId": "user123",
+  "type": "community_report",
+  "category": "Harassment",
+  "description": "<typed text>",
+  "severity": 3,
+  "location": { "latitude": 13.08, "longitude": 80.27 },
+  "timestamp": "<ISO>",
+  "timezone_offset_minutes": 330
+}
+```
+
+Express requires `description`, then builds an ML body without it: `id`, `latitude`, `longitude`, `timestamp`, `type`, `severity`, `category`, `verified: false`, `user_id`, and the offset if present. FastAPI `IncidentRequest` rejects a `type` outside `panic_alert|community_report`, a severity outside 1–5, and an offset outside −840..840.
+
+Panic body from `triggerPanicAlert` in `api.ts`: `userId`, `location.{latitude,longitude}`, `emergencyContacts` as an array of phone strings, `timestamp`, `timezone_offset_minutes`. Express adds severity 5, category `emergency`, type `panic_alert`, `verified: true`. The phone numbers are counted for the response field `contactsNotified` and then dropped. No SMS library is in `package.json`.
+
+Heatmap query from `fetchHeatmap`: `lat`, `lng`, `radius`, `grid_size`, `timestamp`, `local_hour`, `timezone_offset_minutes`. Express parses them and calls `getHeatmap(..., includeClusters=false)`. The ML query also sends `include_time_factor: true`.
+
+Safe-route query: four numbers. Express adds Google waypoints and ML scores, then returns `safetyScore`, `riskScore`, `distance`, `safeDistance`, `highRiskSegments`, `waypoints`, `duration`, `instructions`, and `recommendedRoute`.
+
+### 16.5 Map behavior the fullstack layer invented on top of the score
+
+`HeatmapMap.android.tsx` decides **when** to ask, not how to score.
+
+- Home passes `radius={10000}` and `gridSize={200}`. Inside the map those are a maximum radius and a coarsest grid.
+- `onRegionChangeComplete` waits 450 ms, then sets the query center to 4 decimal places.
+- Radius is half the longer screen edge in meters, times 1.1, rounded to the nearest 250 m, clamped to `[1000, 10000]`. Meter conversion uses `111000 * cos(latitude)` for longitude, which the Python heatmap box does not.
+- Grid tier is 50, 100, or 200 with hysteresis. Leaving 50 m needs radius `> 3000`. Entering 50 m from 100 m needs radius `< 2500`. Entering 200 m needs radius `> 8000`. Leaving 200 m needs radius `< 7000`.
+- A request is skipped when `lat:lng:radius:grid` is unchanged.
+- Responses carry a sequence number. A late response from an older pan is ignored.
+- Drawn circles: `risk_score > 1`, at most 1000 of them. Radius of each circle is `gridSize * 0.7` meters. Color is a hand-written RGB lerp: 1–2 yellow `#FACC15` toward amber `#EAB308`, 2–4 orange `#F97316` toward red `#EF4444`, 4–5 red toward `#B91C1C`. Opacity is `0.22 + (score/5)*0.48`.
+- The fallback list (`HeatmapMapFallback.tsx`) uses different cuts: `>= 4` red, `>= 2.5` orange, `>= 1.5` yellow, else green. The mobile README's legend matches the fallback, not the native lerp.
+
+Route polylines: selected route uses theme primary `#5B9BD5`. Others are green `#4CAF50` at safety `>= 0.7`, orange `#FF9800` at `>= 0.4`, else red `#F44336`. Opening Google Maps directions samples the polyline down to 23 intermediate points because the URL the screen builds is the public maps directions URL, not the Routes API.
+
+Two Google keys exist and they are not the same channel. The app key is a literal in `frontend/mobile/app.json` for the native map tiles. The server key is `process.env.GOOGLE_MAPS_API_KEY`, default empty, used for Routes, Places Autocomplete, and Geocoding. An empty server key still returns the straight-line fallback from `getRouteOptions`, so route planning fails soft into a two-point segment rather than throwing inside the Google client. Places search returns `[]` on `REQUEST_DENIED`. The route screen then shows no suggestions.
+
+### 16.6 Realtime, room by room
+
+Server, `setupWebSocket`:
+
+- Client emits `subscribe:location` with `{lat, lng, radius}`. Room name is `location:` + lat to 4 decimals + `:` + lng to 4 decimals + `:` + radius. The radius is stringified as the client sent it. The mobile client sends the integer meter radius.
+- Client emits `subscribe:incidents` and joins `incidents:all`.
+- `emitNewIncident` writes `timestamp` to "now", dropping the incident timestamp that the caller passed. It emits to `incidents:all` and to every location room whose center is within that room's radius of the point. Distance is haversine with radius `6371000`, duplicated again in this file rather than shared with Python.
+
+Client, `websocket.ts`:
+
+- `socket.io-client` is loaded with `require`. `metro.config.js` adds `mjs` and `cjs` and turns on package exports so that require resolves.
+- Transports start at `polling` and may upgrade. Connect failure is logged once. The UI keeps using HTTP.
+- `incident:new` is deduplicated for 10 seconds per `incidentId`, because the server can deliver the same event on the global room and on a location room.
+- The heatmap's `subscribeToLocation` callback sets heatmap state from `data.heatmap`. The server never emits `heatmap:update`, so that callback does not run. Refresh of colors is the HTTP refetch.
+- Home's heatmap effect does not disconnect the socket on unmount. The community screen's effect does call `disconnectWebSocket` on unmount. Whichever screen unmounted last wins. That is the code as written.
+
+### 16.7 State the user can actually lose
+
+| State | Where it lives | What clears it |
+| --- | --- | --- |
+| Admin JWT | `localStorage.admin_token` | Logout, or any 401 |
+| Emergency contacts | AsyncStorage `@emergency_contacts` | Delete button, or a process restart if AsyncStorage failed to load and the memory fallback was used |
+| Report draft | React state in `ReportsScreen` | Successful submit, or leaving the component |
+| Heatmap cells | React state in the map component | Next successful fetch replaces them |
+| Panic "active" | `useState` in `PanicScreen` | Cancel confirm, or remount. The server status route always returns `hasActivePanic: false`. |
+| Selected route | React state in `RoutePlanningScreen` | A new search |
+
+There is no global store (no Redux, no Zustand, no React Query). Each screen fetches in `useEffect`.
+
+### 16.8 Error strings the UI will show
+
+- Map load throws: Android overlay prints the error and the sentence `Make sure ML service is running: cd backend/ml && uvicorn app.main:app`, plus Retry.
+- Location permission denied on the Android map: `Location permission denied. Using Chennai center.`
+- Report validation: alerts for missing category, description, or location.
+- Image picker missing: alert that a development build (`npx expo run:android`) is required.
+- Route search under 2 characters: no request. Failure: `Failed to search locations...`.
+- Admin pages: the `Error:` string from `data.error` or `data.message`, which is what Express puts in the JSON.
+
+Express heatmap success with zero cells is still `success: true`. The map then draws nothing and does not treat it as the error overlay. Quiet data and a dead ML service look the same on the map, except the dead path also sets `warning` on the JSON, which the phone does not read. The phone only checks `response.success && response.heatmap`.
+
+### 16.9 A change, and every file it touches
+
+These are the paths that already exist, so a fullstack change stays honest about the blast radius.
+
+**Show the typed description in the community list.** Today the list text is built in `backend/api/src/routes/reports.ts` from `category`. The column does not exist. The chain is `ReportsScreen` body (already sends it) → `reports.ts` (must keep it) → `IncidentRequest` → `INSERT` → migration → `get_incidents` select list → the mapper in `GET /api/reports/all` → `CommunityReport.description` → `ReportDetailsScreen`. Until that chain exists, editing only the React text will not persist.
+
+**Stop scoring rejected rows.** The filter is not in Express. It is the SQL in `get_incidents_in_radius` and `get_incidents` inside `backend/ml/app/db/storage.py`. Admin verify/reject already sets the boolean.
+
+**Make panic show up on the heatmap immediately.** Insert already affects the next score. The missing piece on the API side is that `panic.ts` does not call `emitNewIncident`. The heatmap's 60 second poll and the next pan will still pick the row up without a socket event.
+
+**Notify the phones in `emergencyContacts`.** No file sends a message. The response field `actions.contactsNotified` is `emergencyContacts.length`. A real sender would be new code in `panic.ts` plus a provider dependency that is not in `package.json` today. The contact list itself is already saved on device in `PanicScreen`.
+
+**Protect mobile routes.** `requireAdmin` is the only middleware of its kind, and it is mounted only at `/api/admin`. Mobile routes are registered in `app.ts` with no guard. Login would have to stop returning `mock_jwt_token_here` in `auth.ts` before a guard would have a real token to check. The phone would have to store that token and send it from `src/services/api.ts`, which currently sets only `Content-Type`.
+
+**Point the stack at a machine that is not `192.168.1.12`.** The host is duplicated, not read from one config: `frontend/mobile/src/services/api.ts`, `frontend/admin/vite.config.ts`, `backend/api/src/services/mlService.ts`, `backend/api/src/routes/reports.ts` (a second ML URL, separate from the axios client), `backend/api/src/app.ts` log lines, and the two Node test scripts. The ML database host is a different setting, `db_host` in `backend/ml/app/config.py`, default `localhost`.
+
+### 16.10 Build and native surface
+
+`frontend/mobile/app.json`: portrait, `newArchEnabled: true`, iOS bundle and Android package `com.womensafety.mobile`, location usage strings, Android permissions `ACCESS_FINE_LOCATION`, `ACCESS_COARSE_LOCATION`, `CAMERA`, `READ_EXTERNAL_STORAGE`, `WRITE_EXTERNAL_STORAGE`. The image-picker plugin adds its own photo and camera purpose strings. `eas.json` builds Android APKs for `development` (dev client), `preview`, and `production`. EAS project id `a0688f1d-8023-4486-9a61-22c5aa9fa70b` is in `app.json` `extra.eas`.
+
+Maps on Android use `PROVIDER_GOOGLE` from `react-native-maps` 1.20.1. iOS uses `HeatmapMap.ios.tsx`. Web and a failed native require use the list fallback. Expo SDK is 54, React Native 0.81.5, React 19.1.0.
+
+Admin has no map library. Heatmap is inputs plus tables. Analytics bars are divs whose pixel height is `(count / maxCount) * 180`, with a minimum of 8 pixels when count is positive. There is no chart dependency in `frontend/admin/package.json`. The dependencies there are React, React DOM, and React Router. Vite is the dev server and the bundler.
+
+Express security middleware is `helmet()` and `cors({ origin: "*", credentials: true })`. Socket.IO uses the same open origin. Body JSON is limited to 10 mb, which is larger than any payload the current clients send. The report body is small because media is not attached.
+
+---
